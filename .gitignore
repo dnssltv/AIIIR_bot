@@ -1,0 +1,12 @@
+# virtual environment
+.venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# env variables
+.env
+
+# local db (если не хочешь хранить тестовые данные)
+air.db
