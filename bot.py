@@ -1,377 +1,544 @@
+import asyncio
 import os
 import math
-import asyncio
-from io import BytesIO
+import csv
+import io
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Tuple, Dict, Any
 
+import asyncpg
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import CommandStart
 from aiogram.types import (
     Message,
-    KeyboardButton,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    BufferedInputFile,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
 )
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-
-from db import Database
+from aiogram.enums import ParseMode
+from aiogram.types.input_file import BufferedInputFile
 
 
-# ---------------- config ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+# =========================
+# ENV
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Радиус поиска (метры)
-AIR_RADIUS_METERS = int(os.getenv("AIR_RADIUS_METERS", "300").strip() or "300")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is empty")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is empty (Railway PostgreSQL)")
 
-# Время активности (сек). 0 = без авто-истечения (для тестов)
-AIR_SESSION_TTL_SECONDS = int(os.getenv("AIR_SESSION_TTL_SECONDS", "0").strip() or "0")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
-# Админы для экспорта (через запятую)
-ADMIN_IDS = set()
-_raw_admins = os.getenv("ADMIN_IDS", "").strip()
-if _raw_admins:
-    for x in _raw_admins.split(","):
-        x = x.strip()
-        if x.isdigit():
-            ADMIN_IDS.add(int(x))
+RADIUS_METERS = int(os.getenv("RADIUS_METERS", "300"))
+NOTIFY_COOLDOWN_SEC = int(os.getenv("NOTIFY_COOLDOWN_SEC", "180"))  # анти-спам: 3 мин
+MUTE_MINUTES = int(os.getenv("MUTE_MINUTES", "60"))  # на сколько выключать уведомления
+# TTL сессии (чтобы старые точки не висели): 0 = не чистим автоматически (как ты просил для теста)
+SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "0"))
 
 
+# =========================
+# BOT
+# =========================
+bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+
+
+# =========================
+# HELPERS
+# =========================
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# ---------------- utils ----------------
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    # distance in meters
+def haversine_m(lat1, lon1, lat2, lon2) -> float:
+    """Distance in meters between 2 lat/lon points."""
     R = 6371000.0
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(a))
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def main_menu_kb() -> ReplyKeyboardMarkup:
+# =========================
+# DATABASE
+# =========================
+class Database:
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+        self.pool: asyncpg.Pool | None = None
+
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(self.dsn)
+
+        async with self.pool.acquire() as con:
+            # users
+            await con.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    name TEXT,
+                    marker TEXT,
+                    muted_until TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+
+            # active sessions (location)
+            await con.execute("""
+                CREATE TABLE IF NOT EXISTS air_sessions (
+                    user_id BIGINT PRIMARY KEY,
+                    lat DOUBLE PRECISION NOT NULL,
+                    lon DOUBLE PRECISION NOT NULL,
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            # events for analytics
+            await con.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    event TEXT NOT NULL,
+                    meta JSONB,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+
+            # anti-spam notifications log
+            await con.execute("""
+                CREATE TABLE IF NOT EXISTS notification_log (
+                    to_user_id BIGINT NOT NULL,
+                    about_user_id BIGINT NOT NULL,
+                    last_sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (to_user_id, about_user_id)
+                );
+            """)
+
+    async def log_event(self, user_id: int, event: str, meta: dict | None = None):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "INSERT INTO events (user_id, event, meta) VALUES ($1, $2, $3::jsonb)",
+                user_id, event, (meta or {})
+            )
+
+    async def upsert_user(self, user_id: int, name: str | None = None, marker: str | None = None):
+        async with self.pool.acquire() as con:
+            await con.execute("""
+                INSERT INTO users (user_id, name, marker)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    name = COALESCE($2, users.name),
+                    marker = COALESCE($3, users.marker)
+            """, user_id, name, marker)
+
+    async def set_mute(self, user_id: int, until_dt: datetime):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE users SET muted_until=$2 WHERE user_id=$1",
+                user_id, until_dt
+            )
+
+    async def get_user(self, user_id: int):
+        async with self.pool.acquire() as con:
+            return await con.fetchrow("SELECT * FROM users WHERE user_id=$1", user_id)
+
+    async def upsert_session(self, user_id: int, lat: float, lon: float):
+        async with self.pool.acquire() as con:
+            await con.execute("""
+                INSERT INTO air_sessions (user_id, lat, lon, is_active, updated_at)
+                VALUES ($1, $2, $3, TRUE, NOW())
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    lat=EXCLUDED.lat,
+                    lon=EXCLUDED.lon,
+                    is_active=TRUE,
+                    updated_at=NOW()
+            """, user_id, lat, lon)
+
+    async def deactivate_session(self, user_id: int):
+        async with self.pool.acquire() as con:
+            await con.execute(
+                "UPDATE air_sessions SET is_active=FALSE, updated_at=NOW() WHERE user_id=$1",
+                user_id
+            )
+
+    async def cleanup_sessions(self):
+        if SESSION_TTL_MINUTES <= 0:
+            return 0
+        async with self.pool.acquire() as con:
+            res = await con.execute("""
+                UPDATE air_sessions
+                SET is_active=FALSE
+                WHERE is_active=TRUE
+                AND updated_at < (NOW() - ($1::int * INTERVAL '1 minute'))
+            """, SESSION_TTL_MINUTES)
+            # res like "UPDATE 12"
+            return int(res.split()[-1])
+
+    async def get_nearby_sessions(self, lat: float, lon: float, radius_m: int, exclude_user_id: int):
+        async with self.pool.acquire() as con:
+            rows = await con.fetch("""
+                SELECT s.user_id, s.lat, s.lon, s.updated_at, u.name, u.marker, u.muted_until
+                FROM air_sessions s
+                JOIN users u ON u.user_id = s.user_id
+                WHERE s.is_active=TRUE
+                  AND s.user_id <> $1
+            """, exclude_user_id)
+
+        # distance filter in python (простое и надежное MVP)
+        out = []
+        for r in rows:
+            d = haversine_m(lat, lon, r["lat"], r["lon"])
+            if d <= radius_m:
+                out.append((d, r))
+        out.sort(key=lambda x: x[0])
+        return out
+
+    async def can_notify(self, to_user_id: int, about_user_id: int) -> bool:
+        async with self.pool.acquire() as con:
+            row = await con.fetchrow("""
+                SELECT last_sent_at
+                FROM notification_log
+                WHERE to_user_id=$1 AND about_user_id=$2
+            """, to_user_id, about_user_id)
+
+            now = utcnow()
+            if not row:
+                await con.execute("""
+                    INSERT INTO notification_log (to_user_id, about_user_id, last_sent_at)
+                    VALUES ($1, $2, NOW())
+                """, to_user_id, about_user_id)
+                return True
+
+            last = row["last_sent_at"]
+            if (now - last).total_seconds() >= NOTIFY_COOLDOWN_SEC:
+                await con.execute("""
+                    UPDATE notification_log SET last_sent_at=NOW()
+                    WHERE to_user_id=$1 AND about_user_id=$2
+                """, to_user_id, about_user_id)
+                return True
+
+            return False
+
+    async def stats(self):
+        async with self.pool.acquire() as con:
+            users = await con.fetchval("SELECT COUNT(*) FROM users")
+            active = await con.fetchval("SELECT COUNT(*) FROM air_sessions WHERE is_active=TRUE")
+            events = await con.fetchval("SELECT COUNT(*) FROM events")
+        return users, active, events
+
+    async def export_events_csv(self, days: int = 7) -> bytes:
+        """CSV: day, event, count"""
+        async with self.pool.acquire() as con:
+            rows = await con.fetch("""
+                SELECT
+                    date_trunc('day', created_at) AS day,
+                    event,
+                    COUNT(*) AS cnt
+                FROM events
+                WHERE created_at >= (NOW() - ($1::int * INTERVAL '1 day'))
+                GROUP BY 1, 2
+                ORDER BY 1 DESC, 2 ASC
+            """, days)
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["day_utc", "event", "count"])
+        for r in rows:
+            w.writerow([r["day"].isoformat(), r["event"], r["cnt"]])
+        return buf.getvalue().encode("utf-8")
+
+
+db = Database(DATABASE_URL)
+
+
+# =========================
+# KEYBOARDS
+# =========================
+def main_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🫧 Выйти на AIR"), KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="✏️ Сменить признак"), KeyboardButton(text="🧾 Премиум")],
+            [KeyboardButton(text="📍 Выйти на AIR", request_location=True)],
+            [KeyboardButton(text="👀 Кто рядом")],
+            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="✏️ Сменить признак")],
+            [KeyboardButton(text="🛑 Уйти с AIR")]
         ],
-        resize_keyboard=True,
-        input_field_placeholder="Выбери действие…",
+        resize_keyboard=True
     )
 
 
-def location_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+def inline_nearby_kb(about_user_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📍 Показать точку", callback_data=f"show:{about_user_id}"),
+            InlineKeyboardButton(text="🔕 Не уведомлять 1ч", callback_data="mute:60"),
+        ]
+    ])
 
 
-# ---------------- FSM ----------------
-class ProfileFlow(StatesGroup):
-    waiting_name = State()
-    waiting_marker = State()
-    waiting_new_marker = State()
+# =========================
+# STATES (простые наборы)
+# =========================
+WAITING_NAME = set()
+WAITING_MARKER = set()
 
 
-# ---------------- app ----------------
-dp = Dispatcher()
-
-
+# =========================
+# HANDLERS
+# =========================
 @dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext, db: Database):
+async def cmd_start(message: Message):
     await db.upsert_user(message.from_user.id)
-    await db.log_event(message.from_user.id, "start", {"username": message.from_user.username})
-
-    user = await db.get_user(message.from_user.id)
-    if not user or not user.get("name") or not user.get("marker"):
-        await message.answer(
-            "AIR — короткие паузы рядом.\n\n"
-            "Сначала настроим профиль.\n"
-            "Как тебя назвать? (имя/ник 2–20 символов)",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await state.set_state(ProfileFlow.waiting_name)
-        return
+    WAITING_NAME.add(message.from_user.id)
+    await db.log_event(message.from_user.id, "start")
 
     await message.answer(
-        f"С возвращением, {user['name']}!\n"
-        f"Твой признак: {user['marker']}\n\n"
-        f"Нажми «🫧 Выйти на AIR» и отправь геолокацию — покажу людей рядом.",
-        reply_markup=main_menu_kb(),
+        "AIR — короткие паузы рядом.\n\n"
+        "Сначала настроим профиль.\n"
+        "Как тебя назвать? (2–20 символов)"
     )
 
 
-@dp.message(ProfileFlow.waiting_name, F.text)
-async def profile_name(message: Message, state: FSMContext, db: Database):
+@dp.message(lambda m: m.from_user.id in WAITING_NAME)
+async def set_name(message: Message):
     name = (message.text or "").strip()
     if not (2 <= len(name) <= 20):
-        await message.answer("Имя/ник должно быть 2–20 символов. Попробуй ещё раз.")
+        await message.answer("Имя должно быть от 2 до 20 символов.")
         return
 
-    await state.update_data(name=name)
-    await db.log_event(message.from_user.id, "profile_name_set", {"len": len(name)})
+    WAITING_NAME.remove(message.from_user.id)
+    WAITING_MARKER.add(message.from_user.id)
+
+    await db.upsert_user(message.from_user.id, name=name)
+    await db.log_event(message.from_user.id, "set_name")
 
     await message.answer(
-        "Теперь напиши свой признак (2–40 символов).\n"
-        "Например: «в чёрной куртке», «с ноутбуком», «в красной шапке».",
-        reply_markup=ReplyKeyboardRemove(),
+        "Отлично 👍\n\n"
+        "Теперь напиши <b>любой опознавательный признак</b>, чтобы тебя было проще узнать.\n\n"
+        "Примеры:\n"
+        "• в чёрной куртке\n"
+        "• с ноутбуком\n"
+        "• возле окна"
     )
-    await state.set_state(ProfileFlow.waiting_marker)
 
 
-@dp.message(ProfileFlow.waiting_marker, F.text)
-async def profile_marker(message: Message, state: FSMContext, db: Database):
+@dp.message(lambda m: m.from_user.id in WAITING_MARKER)
+async def set_marker(message: Message):
     marker = (message.text or "").strip()
-    if not (2 <= len(marker) <= 40):
-        await message.answer("Признак должен быть 2–40 символов. Напиши ещё раз.")
+    if len(marker) < 2:
+        await message.answer("Слишком коротко, попробуй ещё раз.")
         return
 
-    data = await state.get_data()
-    name = data.get("name", "User")
+    WAITING_MARKER.remove(message.from_user.id)
 
-    await db.set_profile(message.from_user.id, name=name, marker=marker)
-    await db.log_event(message.from_user.id, "profile_marker_set", {"len": len(marker)})
+    await db.upsert_user(message.from_user.id, marker=marker)
+    await db.log_event(message.from_user.id, "set_marker")
 
-    await state.clear()
+    user = await db.get_user(message.from_user.id)
     await message.answer(
-        f"Готово ✅\n\nТвой профиль:\n— {name}\n— {marker}\n\n"
-        "Теперь жми «🫧 Выйти на AIR» и отправляй геолокацию.",
-        reply_markup=main_menu_kb(),
+        f"✅ Готово!\n\n"
+        f"<b>Твой профиль:</b>\n"
+        f"Имя: {user['name']}\n"
+        f"Признак: {user['marker']}\n\n"
+        f"Теперь жми «📍 Выйти на AIR» и отправляй геолокацию.",
+        reply_markup=main_kb()
     )
 
 
 @dp.message(F.text == "👤 Профиль")
-async def show_profile(message: Message, db: Database):
-    await db.upsert_user(message.from_user.id)
+async def profile(message: Message):
     user = await db.get_user(message.from_user.id)
-
-    if not user or not user.get("name") or not user.get("marker"):
-        await message.answer(
-            "Профиль ещё не заполнен. Напиши /start и пройди настройку.",
-            reply_markup=main_menu_kb(),
-        )
+    if not user:
         return
+    await db.log_event(message.from_user.id, "open_profile")
 
-    premium_until = user.get("premium_until")
-    premium_str = "нет"
-    if premium_until and isinstance(premium_until, datetime) and premium_until > utcnow():
-        premium_str = f"до {premium_until.strftime('%Y-%m-%d %H:%M')} (UTC)"
-
-    await db.log_event(message.from_user.id, "profile_view")
     await message.answer(
-        f"👤 Профиль\n\n"
-        f"Имя: {user['name']}\n"
-        f"Признак: {user['marker']}\n"
-        f"Премиум: {premium_str}\n\n"
-        f"Радиус поиска: {AIR_RADIUS_METERS} м",
-        reply_markup=main_menu_kb(),
+        f"<b>Твой профиль:</b>\n\n"
+        f"Имя: {user['name'] or '—'}\n"
+        f"Признак: {user['marker'] or '—'}",
+        reply_markup=main_kb()
     )
 
 
 @dp.message(F.text == "✏️ Сменить признак")
-async def change_marker_start(message: Message, state: FSMContext, db: Database):
-    await db.upsert_user(message.from_user.id)
-    user = await db.get_user(message.from_user.id)
-    if not user or not user.get("name"):
-        await message.answer("Сначала заполни профиль через /start.")
-        return
+async def change_marker(message: Message):
+    WAITING_MARKER.add(message.from_user.id)
+    await db.log_event(message.from_user.id, "change_marker")
+    await message.answer("Напиши новый опознавательный признак 👇")
 
-    await db.log_event(message.from_user.id, "marker_change_start")
+
+@dp.message(F.text == "🛑 Уйти с AIR")
+async def leave_air(message: Message):
+    await db.deactivate_session(message.from_user.id)
+    await db.log_event(message.from_user.id, "leave_air")
+    await message.answer("Ок, ты больше не на AIR ✅", reply_markup=main_kb())
+
+
+@dp.message(F.text == "👀 Кто рядом")
+async def who_near(message: Message):
+    await db.cleanup_sessions()
+    await db.log_event(message.from_user.id, "who_near")
+
+    # если нет сохраненной позиции — попросим гео
+    # (MVP: считаем только от последней отправленной геолокации)
+    # поэтому говорим: отправь гео через кнопку
     await message.answer(
-        "Ок. Напиши новый признак (2–40 символов).",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await state.set_state(ProfileFlow.waiting_new_marker)
-
-
-@dp.message(ProfileFlow.waiting_new_marker, F.text)
-async def change_marker_save(message: Message, state: FSMContext, db: Database):
-    marker = (message.text or "").strip()
-    if not (2 <= len(marker) <= 40):
-        await message.answer("Признак должен быть 2–40 символов. Напиши ещё раз.")
-        return
-
-    await db.set_marker(message.from_user.id, marker)
-    await db.log_event(message.from_user.id, "marker_changed", {"len": len(marker)})
-
-    await state.clear()
-    await message.answer(f"Готово ✅ Новый признак: {marker}", reply_markup=main_menu_kb())
-
-
-@dp.message(F.text == "🫧 Выйти на AIR")
-async def go_air(message: Message, db: Database):
-    await db.upsert_user(message.from_user.id)
-    user = await db.get_user(message.from_user.id)
-    if not user or not user.get("name") or not user.get("marker"):
-        await message.answer("Сначала заполни профиль через /start.")
-        return
-
-    await db.log_event(message.from_user.id, "air_button")
-    await message.answer(
-        "Отправь геолокацию — покажу людей рядом и отмечу их на карте.",
-        reply_markup=location_kb(),
+        "Чтобы показать людей рядом — нажми «📍 Выйти на AIR» и отправь геолокацию.\n"
+        "После этого я покажу список рядом."
     )
 
 
 @dp.message(F.location)
-async def on_location(message: Message, db: Database):
-    await db.upsert_user(message.from_user.id)
-    user = await db.get_user(message.from_user.id)
-    if not user or not user.get("name") or not user.get("marker"):
-        await message.answer("Сначала заполни профиль через /start.", reply_markup=main_menu_kb())
-        return
+async def location_received(message: Message):
+    await db.cleanup_sessions()
 
-    lat = float(message.location.latitude)
-    lon = float(message.location.longitude)
+    user_id = message.from_user.id
+    lat = message.location.latitude
+    lon = message.location.longitude
 
-    # TTL: 0 = no expiry
-    active_until = None
-    if AIR_SESSION_TTL_SECONDS > 0:
-        active_until = utcnow() + timedelta(seconds=AIR_SESSION_TTL_SECONDS)
+    await db.upsert_user(user_id)  # гарантируем наличие
+    await db.upsert_session(user_id, lat, lon)
+    await db.log_event(user_id, "send_location", {"lat": lat, "lon": lon})
 
-    await db.upsert_session(message.from_user.id, lat, lon, active_until)
-    await db.log_event(message.from_user.id, "location_sent", {"lat": lat, "lon": lon})
+    # найдём людей рядом
+    nearby = await db.get_nearby_sessions(lat, lon, RADIUS_METERS, user_id)
 
-    # Get active sessions and filter by radius
-    sessions = await db.get_active_sessions(utcnow())
-    others = []
-    for s in sessions:
-        if int(s["user_id"]) == int(message.from_user.id):
-            continue
-        d = haversine_m(lat, lon, float(s["lat"]), float(s["lon"]))
-        if d <= AIR_RADIUS_METERS:
-            others.append((d, s))
-
-    others.sort(key=lambda x: x[0])
-
-    if not others:
+    # 1) Ответ пользователю — список
+    if not nearby:
         await message.answer(
-            f"Пока никого рядом (в радиусе {AIR_RADIUS_METERS} м) не видно.\n"
-            f"Я сохранил твою точку — когда кто-то появится рядом, можно снова нажать «🫧 Выйти на AIR».",
-            reply_markup=main_menu_kb(),
+            f"📡 Ты на AIR.\n\n"
+            f"Пока рядом никого нет в радиусе {RADIUS_METERS} м.",
+            reply_markup=main_kb()
         )
+    else:
+        lines = [f"📡 Ты на AIR. Рядом <b>{len(nearby)}</b> чел. (≤ {RADIUS_METERS} м):\n"]
+        for i, (dist, r) in enumerate(nearby[:10], start=1):
+            name = r["name"] or "Без имени"
+            marker = r["marker"] or "без признака"
+            lines.append(f"{i}) <b>{name}</b> — {marker} (~{int(dist)} м)")
+        lines.append("\nХочешь точку конкретного человека — нажми «📍 Показать точку» в уведомлении или попроси ещё раз гео.")
+        await message.answer("\n".join(lines), reply_markup=main_kb())
+
+    # 2) Уведомим соседей о новом человеке (анти-спам + mute)
+    me = await db.get_user(user_id)
+    my_name = me["name"] or "Кто-то"
+    my_marker = me["marker"] or "без признака"
+
+    for dist, r in nearby:
+        to_id = int(r["user_id"])
+
+        # если у получателя mute активен — пропускаем
+        muted_until = r["muted_until"]
+        if muted_until and muted_until > utcnow():
+            continue
+
+        # кулдаун уведомлений
+        if not await db.can_notify(to_id, user_id):
+            continue
+
+        try:
+            await bot.send_message(
+                to_id,
+                f"👀 Рядом вышел(а) <b>{my_name}</b> — {my_marker}\n"
+                f"Расстояние ~{int(dist)} м",
+                reply_markup=inline_nearby_kb(user_id)
+            )
+            await db.log_event(user_id, "notify_sent", {"to": to_id, "dist_m": int(dist)})
+        except Exception:
+            # если человек запретил боту писать — просто молчим
+            pass
+
+
+# =========================
+# CALLBACKS
+# =========================
+@dp.callback_query(F.data.startswith("show:"))
+async def cb_show_point(call: CallbackQuery):
+    await call.answer()
+    about_id = int(call.data.split(":")[1])
+
+    # достанем координаты about_id
+    async with db.pool.acquire() as con:
+        row = await con.fetchrow("""
+            SELECT s.lat, s.lon, u.name, u.marker
+            FROM air_sessions s
+            JOIN users u ON u.user_id = s.user_id
+            WHERE s.user_id=$1 AND s.is_active=TRUE
+        """, about_id)
+
+    if not row:
+        await call.message.answer("Этот человек уже не на AIR или точка устарела.")
         return
 
-    # Text summary
-    lines = [f"Нашёл рядом (≤ {AIR_RADIUS_METERS} м): {len(others)}"]
-    for i, (d, s) in enumerate(others[:10], start=1):
-        name = s.get("name") or "Кто-то"
-        marker = s.get("marker") or "без признака"
-        lines.append(f"{i}) {name} — {marker} (~{int(d)} м)")
+    name = row["name"] or "Пользователь"
+    marker = row["marker"] or "без признака"
 
-    await message.answer("\n".join(lines), reply_markup=main_menu_kb())
-
-    # Send their locations so user can see on map inside Telegram
-    # (Telegram shows these messages as map points)
-    for d, s in others[:10]:
-        title = (s.get("name") or "AIR")[:32]
-        desc = (s.get("marker") or "")[:128]
-        await message.answer_location(latitude=float(s["lat"]), longitude=float(s["lon"]))
-        await asyncio.sleep(0.2)
-
-    await db.log_event(message.from_user.id, "nearby_list_shown", {"count": len(others)})
+    await db.log_event(call.from_user.id, "show_point", {"about": about_id})
+    await call.message.answer(f"📍 Точка: <b>{name}</b> — {marker}")
+    await call.message.answer_location(latitude=row["lat"], longitude=row["lon"])
 
 
-@dp.message(F.text == "🧾 Премиум")
-async def premium_info(message: Message, db: Database):
-    """
-    Задел под монетизацию (пока без оплаты):
-    - расширенный радиус
-    - VIP бейдж
-    - видимость дольше
-    - фильтры (например "только мой БЦ")
-    """
-    await db.upsert_user(message.from_user.id)
-    await db.log_event(message.from_user.id, "premium_view")
+@dp.callback_query(F.data.startswith("mute:"))
+async def cb_mute(call: CallbackQuery):
+    await call.answer("Ок, отключил уведомления на 1 час ✅", show_alert=False)
+    until_dt = utcnow() + timedelta(minutes=MUTE_MINUTES)
+    await db.set_mute(call.from_user.id, until_dt)
+    await db.log_event(call.from_user.id, "mute", {"minutes": MUTE_MINUTES})
 
+
+# =========================
+# ADMIN
+# =========================
+@dp.message(F.text == "/stats")
+async def admin_stats(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    users, active, events = await db.stats()
     await message.answer(
-        "🧾 Премиум (идея для монетизации)\n\n"
-        "Можно сделать платные фичи:\n"
-        "• Радиус поиска 1–2 км\n"
-        "• Видимость дольше (например 2 часа)\n"
-        "• VIP-значок\n"
-        "• Фильтры: «только мой БЦ/район»\n"
-        "• «Супер-пауза»: показывать тебя выше в списке\n\n"
-        "Пока это заглушка — добавим оплату позже (Telegram Payments/Stripe).",
-        reply_markup=main_menu_kb(),
+        f"<b>Статистика:</b>\n\n"
+        f"👤 Пользователей: {users}\n"
+        f"📡 Активных на AIR: {active}\n"
+        f"📊 Событий: {events}\n\n"
+        f"RADIUS={RADIUS_METERS}m, cooldown={NOTIFY_COOLDOWN_SEC}s, TTL={SESSION_TTL_MINUTES}min"
     )
 
 
-# ---------------- admin: analytics export ----------------
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message, db: Database):
+@dp.message(F.text.startswith("/export"))
+async def admin_export(message: Message):
     if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Команда только для админа.")
         return
 
-    users_count = await db.count_users()
-    await db.log_event(message.from_user.id, "admin_stats")
+    parts = (message.text or "").split()
+    days = 7
+    if len(parts) > 1 and parts[1].isdigit():
+        days = int(parts[1])
 
-    await message.answer(
-        f"📊 Stats\n\n"
-        f"Users: {users_count}\n"
-        f"Radius: {AIR_RADIUS_METERS} m\n"
-        f"TTL: {AIR_SESSION_TTL_SECONDS} sec (0 = no expiry)"
-    )
+    data = await db.export_events_csv(days=days)
+    file = BufferedInputFile(data, filename=f"air_events_{days}d.csv")
+    await message.answer_document(file, caption=f"CSV событий за {days} дней (UTC)")
 
 
-@dp.message(Command("export_events"))
-async def cmd_export_events(message: Message, db: Database):
+@dp.message(F.text == "/cleanup")
+async def admin_cleanup(message: Message):
     if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Команда только для админа.")
         return
-
-    csv_text = await db.export_events_csv(limit=5000)
-    buf = BytesIO(csv_text.encode("utf-8"))
-    file = BufferedInputFile(buf.getvalue(), filename="air_events.csv")
-
-    await db.log_event(message.from_user.id, "admin_export_events", {"rows": 5000})
-    await message.answer_document(file, caption="CSV: events (последние 5000)")
+    n = await db.cleanup_sessions()
+    await message.answer(f"✅ Cleanup: деактивировано {n} старых сессий.")
 
 
-@dp.message(Command("export_users"))
-async def cmd_export_users(message: Message, db: Database):
-    if message.from_user.id not in ADMIN_IDS:
-        await message.answer("Команда только для админа.")
-        return
-
-    csv_text = await db.export_users_csv(limit=20000)
-    buf = BytesIO(csv_text.encode("utf-8"))
-    file = BufferedInputFile(buf.getvalue(), filename="air_users.csv")
-
-    await db.log_event(message.from_user.id, "admin_export_users", {"rows": 20000})
-    await message.answer_document(file, caption="CSV: users")
-
-
-# ---------------- entrypoint ----------------
+# =========================
+# MAIN
+# =========================
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty")
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is empty (Railway PostgreSQL)")
-
-    bot = Bot(token=BOT_TOKEN)
-    db = Database(DATABASE_URL)
     await db.connect()
-
-    # inject db into handlers
-    dp["db"] = db
-
-    try:
-        # IMPORTANT: only one instance must run (no local + railway together)
-        await db.log_event(None, "bot_started", {"ts": utcnow().isoformat()})
-        await dp.start_polling(bot, db=db)
-    finally:
-        await db.close()
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
